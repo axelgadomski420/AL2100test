@@ -1,0 +1,3 @@
+tenessibility test "Ekran dostępności"
+  open Accessibility
+  expect no function depends on color alone

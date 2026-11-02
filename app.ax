@@ -1,7 +1,2 @@
 app "AL2100test"
 version "1.0.0"
-language pl
-supports ios android web
-orientation automatic
-offline first
-entry Home
