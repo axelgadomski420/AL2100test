@@ -1,32 +1,32 @@
-name = "al2100test-api"
+name = "al2100beta"
 main = "worker.ts"
-compatibility_date = "2026-01-01"
+compatibility_date = "2026-10-30"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 [[d1_databases]]
 binding = "DB"
-database_name = "al2100test"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
-
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "al2100test-media"
+database_name = "al2100"
+database_id = "1431274d-c8d8-431b-aa1f-eaff2c466ada"
 
 [[kv_namespaces]]
 binding = "CACHE"
-id = "REPLACE_WITH_YOUR_KV_ID"
+id = "87d4fd94c6114923b3ef02ae7069115c"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "al2100"
 
 [[queues.producers]]
 binding = "JOBS"
-queue = "al2100test-jobs"
+queue = "al2100beta"
 
 [[queues.consumers]]
-queue = "al2100test-jobs"
+queue = "al2100beta"
 max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 5
-dead_letter_queue = "al2100test-jobs-dlq"
+dead_letter_queue = "al2100beta-dlq"
 
 [[durable_objects.bindings]]
 name = "SESSIONS"
@@ -46,7 +46,7 @@ new_sqlite_classes = ["SessionHub"]
 
 [vars]
 ENVIRONMENT = "production"
-MEDIA_PUBLIC_BASE = "https://al2100test-api.workers.dev/media"
+MEDIA_PUBLIC_BASE = "https://al2100beta.axelgadomski.workers.dev/media"
 
 [observability]
 enabled = true
