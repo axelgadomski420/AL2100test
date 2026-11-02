@@ -371,6 +371,7 @@ async function issueTokens(
 
   return { accessToken, refreshToken: refreshRaw, expiresAt };
 }
+
 async function handleRegister(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const email = requireString(body, "email", 5, 320).toLowerCase();
@@ -707,6 +708,7 @@ async function handleRevokeDevice(request: Request, env: Env, deviceId: string):
 
   return jsonResponse({ ok: true });
 }
+
 async function assertConversationOwned(env: Env, userId: string, conversationId: string): Promise<void> {
   const row = await env.DB.prepare("SELECT id FROM conversations WHERE id = ? AND user_id = ?")
     .bind(conversationId, userId)
@@ -733,7 +735,8 @@ async function handleUpsertConversation(request: Request, env: Env): Promise<Res
   const mode = requireString(body, "mode", 2, 20);
   const providerId = requireString(body, "providerId", 1, 80);
   const model = requireString(body, "model", 1, 120);
-  const messageCount = typeof body.messageCount === "number" ? body.messageCount : 0;
+  const messageCount = typeof body.messageCount === "number" ? body.messa
+    geCount : 0;
 
   await env.DB.prepare(
     `INSERT INTO conversations (id, user_id, title, persona, mode, provider_id, model, message_count, updated_at, created_at)
@@ -975,6 +978,7 @@ async function handleListMyReports(request: Request, env: Env): Promise<Response
     .all();
   return jsonResponse({ reports: rows.results ?? [] });
 }
+
 async function handleExportAccount(request: Request, env: Env): Promise<Response> {
   const auth = await authenticate(request, env);
 
