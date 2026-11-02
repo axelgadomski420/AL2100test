@@ -19,10 +19,10 @@ bucket_name = "al2100"
 
 [[queues.producers]]
 binding = "JOBS"
-queue = "al2100beta"
+queue = "al2100"
 
 [[queues.consumers]]
-queue = "al2100beta"
+queue = "al200"
 max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 5
@@ -30,7 +30,7 @@ dead_letter_queue = "al2100beta-dlq"
 
 [vars]
 ENVIRONMENT = "production"
-MEDIA_PUBLIC_BASE = "https://al2100beta.axelgadomski.workers.dev/media"
+MEDIA_PUBLIC_BASE = "https://al2100test.axelgadomski.workers.dev/media"
 
 [observability]
 enabled = true
