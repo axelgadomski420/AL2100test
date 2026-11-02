@@ -28,22 +28,6 @@ max_batch_timeout = 5
 max_retries = 5
 dead_letter_queue = "al2100beta-dlq"
 
-[[durable_objects.bindings]]
-name = "SESSIONS"
-class_name = "SessionHub"
-
-[[durable_objects.bindings]]
-name = "RATE_LIMIT"
-class_name = "RateLimiter"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["RateLimiter"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["SessionHub"]
-
 [vars]
 ENVIRONMENT = "production"
 MEDIA_PUBLIC_BASE = "https://al2100beta.axelgadomski.workers.dev/media"
