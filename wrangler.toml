@@ -22,11 +22,11 @@ binding = "JOBS"
 queue = "al2100"
 
 [[queues.consumers]]
-queue = "al200"
+queue = "al2100"
 max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 5
-dead_letter_queue = "al2100beta-dlq"
+dead_letter_queue = "al2100-dlq"
 
 [vars]
 ENVIRONMENT = "production"
