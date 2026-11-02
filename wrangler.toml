@@ -1,3 +1,55 @@
 name = "al2100test-api"
 main = "worker.ts"
 compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "al2100test"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "al2100test-media"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "REPLACE_WITH_YOUR_KV_ID"
+
+[[queues.producers]]
+binding = "JOBS"
+queue = "al2100test-jobs"
+
+[[queues.consumers]]
+queue = "al2100test-jobs"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "al2100test-jobs-dlq"
+
+[[durable_objects.bindings]]
+name = "SESSIONS"
+class_name = "SessionHub"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMIT"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["SessionHub"]
+
+[vars]
+ENVIRONMENT = "production"
+MEDIA_PUBLIC_BASE = "https://al2100test-api.workers.dev/media"
+
+[observability]
+enabled = true
+
+[limits]
+cpu_ms = 200
