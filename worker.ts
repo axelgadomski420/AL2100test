@@ -7,8 +7,6 @@ export interface Env {
   MEDIA: R2Bucket;
   CACHE: KVNamespace;
   JOBS: Queue<JobMessage>;
-  SESSIONS: DurableObjectNamespace;
-  RATE_LIMIT: DurableObjectNamespace;
   JWT_SECRET: string;
   ENVIRONMENT: string;
   MEDIA_PUBLIC_BASE: string;
@@ -251,95 +249,15 @@ async function authenticate(request: Request, env: Env): Promise<AuthContext> {
 }
 
 async function rateLimit(env: Env, key: string, limit: number, windowSeconds: number): Promise<void> {
-  const id = env.RATE_LIMIT.idFromName(key);
-  const stub = env.RATE_LIMIT.get(id);
-  const response = await stub.fetch("https://rate-limit/consume", {
-    method: "POST",
-    body: JSON.stringify({ limit, windowSeconds }),
-    headers: { "content-type": "application/json" },
-  });
-  if (response.status === 429) {
+  const bucket = "rl:" + key + ":" + Math.floor(Date.now() / (windowSeconds * 1000));
+  const raw = await env.CACHE.get(bucket);
+  const count = raw ? Number(raw) || 0 : 0;
+
+  if (count >= limit) {
     throw new HttpError(429, "RATE_LIMITED", "Zbyt wiele żądań. Spróbuj ponownie później.");
   }
-  if (!response.ok) {
-    throw new HttpError(503, "RATE_LIMIT_UNAVAILABLE", "Usługa limitu żądań jest niedostępna.");
-  }
-}
 
-export class RateLimiter {
-  private state: DurableObjectState;
-
-  constructor(state: DurableObjectState) {
-    this.state = state;
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname !== "/consume") return new Response("Not found", { status: 404 });
-
-    let payload: { limit: number; windowSeconds: number };
-    try {
-      payload = (await request.json()) as { limit: number; windowSeconds: number };
-    } catch {
-      return new Response("Bad request", { status: 400 });
-    }
-
-    const now = Date.now();
-    const stored = (await this.state.storage.get<{ count: number; resetAt: number }>("bucket")) ?? {
-      count: 0,
-      resetAt: now + payload.windowSeconds * 1000,
-    };
-
-    if (stored.resetAt <= now) {
-      stored.count = 0;
-      stored.resetAt = now + payload.windowSeconds * 1000;
-    }
-
-    if (stored.count >= payload.limit) {
-      return new Response(JSON.stringify({ allowed: false, resetAt: stored.resetAt }), {
-        status: 429,
-        headers: JSON_HEADERS,
-      });
-    }
-
-    stored.count += 1;
-    await this.state.storage.put("bucket", stored);
-    return new Response(JSON.stringify({ allowed: true, remaining: payload.limit - stored.count }), {
-      status: 200,
-      headers: JSON_HEADERS,
-    });
-  }
-}
-
-export class SessionHub {
-  private state: DurableObjectState;
-
-  constructor(state: DurableObjectState) {
-    this.state = state;
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname === "/register") {
-      const body = (await request.json()) as { deviceId: string; publicKeyText: string | null };
-      const list = (await this.state.storage.get<string[]>("devices")) ?? [];
-      if (!list.includes(body.deviceId)) list.push(body.deviceId);
-      await this.state.storage.put("devices", list);
-      return jsonResponse({ devices: list.length });
-    }
-    if (url.pathname === "/revoke") {
-      const body = (await request.json()) as { deviceId: string };
-      const list = (await this.state.storage.get<string[]>("devices")) ?? [];
-      const next = list.filter((item) => item !== body.deviceId);
-      await this.state.storage.put("devices", next);
-      return jsonResponse({ devices: next.length });
-    }
-    if (url.pathname === "/list") {
-      const list = (await this.state.storage.get<string[]>("devices")) ?? [];
-      return jsonResponse({ devices: list });
-    }
-    return new Response("Not found", { status: 404 });
-  }
+  await env.CACHE.put(bucket, String(count + 1), { expirationTtl: windowSeconds + 10 });
 }
 
 function validatePasswordOrFail(password: string): void {
@@ -389,8 +307,8 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   const now = Date.now();
 
   await env.DB.prepare(
-    `INSERT INTO users (id, email, display_name, password_hash, bio, language, persona, email_verified, created_at, updated_at)
-     VALUES (?, ?, ?, ?, '', 'pl', '', 0, ?, ?)`,
+    `INSERT INTO users (id, email, display_name, password_hash, bio, language, persona, email_verified, email_verified_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, '', 'pl', '', 0, NULL, ?, ?)`,
   )
     .bind(userId, email, displayName, passwordHash, now, now)
     .run();
@@ -440,6 +358,10 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     throw new HttpError(423, "ACCOUNT_LOCKED", "Konto jest tymczasowo zablokowane po nieudanych próbach logowania.");
   }
 
+  if (!user.password_hash || user.password_hash.length === 0) {
+    throw new HttpError(409, "NO_PASSWORD_SET", "To konto nie ma jeszcze hasła. Użyj resetu hasła, aby je ustawić.");
+  }
+
   const ok = await verifyPassword(password, user.password_hash);
   if (!ok) {
     const attempts = user.failed_attempts + 1;
@@ -459,13 +381,6 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   )
     .bind(deviceId, user.id, platform, Date.now(), Date.now())
     .run();
-
-  const hub = env.SESSIONS.get(env.SESSIONS.idFromName(user.id));
-  await hub.fetch("https://sessions/register", {
-    method: "POST",
-    body: JSON.stringify({ deviceId, publicKeyText: null }),
-    headers: { "content-type": "application/json" },
-  });
 
   const tokens = await issueTokens(env, user.id, deviceId, user.email);
 
@@ -553,7 +468,7 @@ async function handleResetConfirm(request: Request, env: Env): Promise<Response>
   if (row.expires_at <= Date.now()) throw new HttpError(400, "RESET_EXPIRED", "Kod resetu wygasł.");
 
   const hash = await hashPassword(newPassword);
-  await env.DB.prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+  await env.DB.prepare("UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?")
     .bind(hash, Date.now(), row.user_id)
     .run();
   await env.DB.prepare("UPDATE password_resets SET used = 1 WHERE id = ?").bind(row.id).run();
@@ -574,8 +489,8 @@ async function handleVerifyEmail(request: Request, env: Env): Promise<Response> 
   if (row.used === 1) throw new HttpError(400, "VERIFY_USED", "Ten kod został już użyty.");
   if (row.expires_at <= Date.now()) throw new HttpError(400, "VERIFY_EXPIRED", "Kod weryfikacyjny wygasł.");
 
-  await env.DB.prepare("UPDATE users SET email_verified = 1, updated_at = ? WHERE id = ?")
-    .bind(Date.now(), row.user_id)
+  await env.DB.prepare("UPDATE users SET email_verified = 1, email_verified_at = ?, updated_at = ? WHERE id = ?")
+    .bind(Date.now(), Date.now(), row.user_id)
     .run();
   await env.DB.prepare("UPDATE email_verifications SET used = 1 WHERE id = ?").bind(row.id).run();
 
@@ -625,6 +540,207 @@ async function handleRedeemRecovery(request: Request, env: Env): Promise<Respons
   return jsonResponse({ ok: true, userId: row.user_id, notice: "Kod przyjęty. Ustaw nowe hasło i zaloguj się ponownie." });
 }
 
+
+// Ustawienie hasła przez użytkownika zalogowanego (na wypadek kont bez hasła).
+
+// ============================================================================
+// Logowanie kodem PIN (4-6 cyfr). PIN jest wiązany z konkretnym urządzeniem,
+// więc skradziony PIN z innego sprzętu nic nie daje. PIN nie zastępuje hasła —
+// jest szybkim wejściem po pierwszym zalogowaniu. Hasło zawsze działa.
+// ============================================================================
+
+function isValidPin(pin: string): boolean {
+  return /^[0-9]{4,6}$/.test(pin);
+}
+
+async function hashPin(pin: string, userId: string): Promise<string> {
+  // PIN ma małą przestrzeń (10^4), więc dokładamy sól z userId i urządzenia,
+  // żeby ten sam PIN na dwóch kontach nie dawał tego samego skrótu.
+  const salt = textToBytes("al2100-pin:" + userId + ":" + pin);
+  const material = textToBytes(pin + ":" + userId);
+  const combined = new Uint8Array(salt.length + material.length);
+  combined.set(salt, 0);
+  combined.set(material, salt.length);
+  const derived = await pbkdf2(base64UrlEncode(combined), textToBytes(userId), 60000);
+  return base64UrlEncode(derived);
+}
+
+async function verifyPin(pin: string, stored: string, userId: string): Promise<boolean> {
+  const candidate = await hashPin(pin, userId);
+  return timingSafeEqual(textToBytes(candidate), textToBytes(stored));
+}
+
+async function handleSetPin(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  const body = await readJson(request);
+  const pin = requireString(body, "pin", 4, 6);
+  const password = requireString(body, "password", 1, 200);
+
+  if (!isValidPin(pin)) {
+    throw new HttpError(400, "PIN_INVALID", "PIN musi mieć od 4 do 6 cyfr.");
+  }
+
+  // PIN ustawiamy tylko po podaniu hasła — inaczej skradziony token dałby PIN.
+  const user = await env.DB.prepare("SELECT password_hash FROM users WHERE id = ?")
+    .bind(auth.userId)
+    .first<{ password_hash: string | null }>();
+  if (!user?.password_hash) {
+    throw new HttpError(409, "NO_PASSWORD_SET", "Najpierw ustaw hasło, potem PIN.");
+  }
+  const ok = await verifyPassword(password, user.password_hash);
+  if (!ok) throw new HttpError(401, "BAD_CREDENTIALS", "Hasło jest nieprawidłowe.");
+
+  const pinHash = await hashPin(pin, auth.userId);
+
+  await env.DB.prepare(
+    "INSERT INTO pin_codes (id, user_id, device_id, pin_hash, failed_attempts, locked_until, created_at, last_used_at) VALUES (?, ?, ?, ?, 0, NULL, ?, NULL) ON CONFLICT(user_id, device_id) DO UPDATE SET pin_hash = excluded.pin_hash, failed_attempts = 0, locked_until = NULL, created_at = excluded.created_at",
+  )
+    .bind(randomId("pin"), auth.userId, auth.deviceId, pinHash, Date.now())
+    .run();
+
+  await env.CACHE.put("pinok:" + auth.deviceId, auth.userId, { expirationTtl: 60 * 60 * 24 * 90 });
+
+  return jsonResponse({ ok: true, notice: "PIN ustawiony. Na tym urządzeniu możesz logować się kodem." });
+}
+
+async function handlePinStatus(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const deviceId = (url.searchParams.get("deviceId") ?? "").slice(0, 120);
+  if (deviceId.length < 4) throw new HttpError(400, "VALIDATION", "Brak identyfikatora urządzenia.");
+
+  const row = await env.DB.prepare(
+    "SELECT u.display_name, u.email FROM pin_codes p JOIN users u ON u.id = p.user_id WHERE p.device_id = ? AND (p.locked_until IS NULL OR p.locked_until < ?)",
+  )
+    .bind(deviceId, Date.now())
+    .first<{ display_name: string; email: string }>();
+
+  if (!row) return jsonResponse({ pinAvailable: false });
+  return jsonResponse({ pinAvailable: true, displayName: row.display_name, email: row.email });
+}
+
+async function handlePinLogin(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const pin = requireString(body, "pin", 4, 6);
+  const deviceId = requireString(body, "deviceId", 4, 120);
+
+  await rateLimit(env, "pin:" + deviceId, 10, 300);
+
+  if (!isValidPin(pin)) throw new HttpError(400, "PIN_INVALID", "PIN musi mieć od 4 do 6 cyfr.");
+
+  const row = await env.DB.prepare(
+    "SELECT id, user_id, pin_hash, failed_attempts, locked_until FROM pin_codes WHERE device_id = ?",
+  )
+    .bind(deviceId)
+    .first<{ id: string; user_id: string; pin_hash: string; failed_attempts: number; locked_until: number | null }>();
+
+  if (!row) throw new HttpError(404, "PIN_NOT_SET", "Na tym urządzeniu nie ustawiono PIN-u.");
+
+  if (row.locked_until !== null && row.locked_until > Date.now()) {
+    const mins = Math.ceil((row.locked_until - Date.now()) / 60000);
+    throw new HttpError(423, "PIN_LOCKED", "Za dużo prób. Spróbuj ponownie za " + mins + " min albo zaloguj się hasłem.");
+  }
+
+  const ok = await verifyPin(pin, row.pin_hash, row.user_id);
+  if (!ok) {
+    const attempts = row.failed_attempts + 1;
+    const lockedUntil = attempts >= 5 ? Date.now() + 1000 * 60 * 15 : null;
+    await env.DB.prepare("UPDATE pin_codes SET failed_attempts = ?, locked_until = ? WHERE id = ?")
+      .bind(attempts, lockedUntil, row.id)
+      .run();
+    const left = Math.max(0, 5 - attempts);
+    throw new HttpError(401, "PIN_WRONG", "Nieprawidłowy PIN. Pozostało prób: " + left + ".");
+  }
+
+  await env.DB.prepare("UPDATE pin_codes SET failed_attempts = 0, locked_until = NULL, last_used_at = ? WHERE id = ?")
+    .bind(Date.now(), row.id)
+    .run();
+
+  const device = await env.DB.prepare("SELECT revoked FROM devices WHERE id = ? AND user_id = ?")
+    .bind(deviceId, row.user_id)
+    .first<{ revoked: number }>();
+  if (!device) throw new HttpError(401, "DEVICE_UNKNOWN", "Urządzenie nie jest powiązane z kontem.");
+  if (device.revoked === 1) throw new HttpError(401, "DEVICE_REVOKED", "Urządzenie zostało odebrane dostęp.");
+
+  const user = await env.DB.prepare("SELECT email FROM users WHERE id = ?")
+    .bind(row.user_id)
+    .first<{ email: string }>();
+
+  const tokens = await issueTokens(env, row.user_id, deviceId, user?.email ?? "");
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (id, user_id, action, subject_type, subject_id, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  )
+    .bind(randomId("aud"), row.user_id, "pin.login", "device", deviceId, "{}", Date.now())
+    .run();
+
+  return jsonResponse({ ...tokens, userId: row.user_id, method: "pin" });
+}
+
+async function handleRemovePin(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  await env.DB.prepare("DELETE FROM pin_codes WHERE user_id = ? AND device_id = ?")
+    .bind(auth.userId, auth.deviceId)
+    .run();
+  return jsonResponse({ ok: true, notice: "PIN usunięty z tego urządzenia." });
+}
+
+async function handleSetPassword(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  const body = await readJson(request);
+  const newPassword = requireString(body, "newPassword", 12, 200);
+  validatePasswordOrFail(newPassword);
+
+  const current = await env.DB.prepare("SELECT password_hash FROM users WHERE id = ?")
+    .bind(auth.userId)
+    .first<{ password_hash: string | null }>();
+
+  if (current?.password_hash) {
+    const oldPassword = requireString(body, "currentPassword", 1, 200);
+    const ok = await verifyPassword(oldPassword, current.password_hash);
+    if (!ok) throw new HttpError(401, "BAD_CREDENTIALS", "Obecne hasło jest nieprawidłowe.");
+  }
+
+  const hash = await hashPassword(newPassword);
+  await env.DB.prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+    .bind(hash, Date.now(), auth.userId)
+    .run();
+
+  await env.DB.prepare("UPDATE sessions SET revoked = 1 WHERE user_id = ? AND device_id != ?")
+    .bind(auth.userId, auth.deviceId)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (id, user_id, action, subject_type, subject_id, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  )
+    .bind(randomId("aud"), auth.userId, "password.set", "user", auth.userId, "{}", Date.now())
+    .run();
+
+  return jsonResponse({ ok: true, notice: "Hasło zapisane. Inne urządzenia zostały wylogowane." });
+}
+
+// Czy konto ma hasło — front pyta, żeby wiedzieć, co pokazać w profilu.
+async function handleAuthCapabilities(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  const row = await env.DB.prepare("SELECT password_hash, email_verified FROM users WHERE id = ?")
+    .bind(auth.userId)
+    .first<{ password_hash: string | null; email_verified: number }>();
+
+  return jsonResponse({
+    passwordEnabled: Boolean(row?.password_hash && row.password_hash.length > 0),
+    emailVerified: row?.email_verified === 1,
+  });
+}
+
+// Unieważnienie wszystkich sesji poza bieżącą.
+async function handleRevokeOtherSessions(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  const result = await env.DB.prepare("UPDATE sessions SET revoked = 1 WHERE user_id = ? AND device_id != ?")
+    .bind(auth.userId, auth.deviceId)
+    .run();
+
+  return jsonResponse({ ok: true, revoked: result.meta?.changes ?? 0, notice: "Pozostałe urządzenia zostały wylogowane." });
+}
+
 async function handleGetMe(request: Request, env: Env): Promise<Response> {
   const auth = await authenticate(request, env);
   const user = await env.DB.prepare(
@@ -636,7 +752,8 @@ async function handleGetMe(request: Request, env: Env): Promise<Response> {
   return jsonResponse({ user, deviceId: auth.deviceId });
 }
 
-async function handleUpdateMe(request: Request, env: Env): Promise<Response> {
+async 
+function handleUpdateMe(request: Request, env: Env): Promise<Response> {
   const auth = await authenticate(request, env);
   const body = await readJson(request);
   const displayName = requireString(body, "displayName", 2, 60);
@@ -670,13 +787,6 @@ async function handleRegisterDevice(request: Request, env: Env): Promise<Respons
     .bind(deviceId, auth.userId, platform, publicKeyText, Date.now(), Date.now())
     .run();
 
-  const hub = env.SESSIONS.get(env.SESSIONS.idFromName(auth.userId));
-  await hub.fetch("https://sessions/register", {
-    method: "POST",
-    body: JSON.stringify({ deviceId, publicKeyText }),
-    headers: { "content-type": "application/json" },
-  });
-
   return jsonResponse({ ok: true, deviceId });
 }
 
@@ -698,13 +808,6 @@ async function handleRevokeDevice(request: Request, env: Env, deviceId: string):
   await env.DB.prepare("UPDATE sessions SET revoked = 1 WHERE user_id = ? AND device_id = ?")
     .bind(auth.userId, deviceId)
     .run();
-
-  const hub = env.SESSIONS.get(env.SESSIONS.idFromName(auth.userId));
-  await hub.fetch("https://sessions/revoke", {
-    method: "POST",
-    body: JSON.stringify({ deviceId }),
-    headers: { "content-type": "application/json" },
-  });
 
   return jsonResponse({ ok: true });
 }
@@ -735,8 +838,7 @@ async function handleUpsertConversation(request: Request, env: Env): Promise<Res
   const mode = requireString(body, "mode", 2, 20);
   const providerId = requireString(body, "providerId", 1, 80);
   const model = requireString(body, "model", 1, 120);
-  const messageCount = typeof body.messageCount === "number" ? body.messa
-    geCount : 0;
+  const messageCount = typeof body.messageCount === "number" ? body.messageCount : 0;
 
   await env.DB.prepare(
     `INSERT INTO conversations (id, user_id, title, persona, mode, provider_id, model, message_count, updated_at, created_at)
@@ -1031,6 +1133,7 @@ async function handleEraseAccount(request: Request, env: Env): Promise<Response>
     env.DB.prepare("DELETE FROM media WHERE user_id = ?").bind(auth.userId),
     env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(auth.userId),
     env.DB.prepare("DELETE FROM devices WHERE user_id = ?").bind(auth.userId),
+    env.DB.prepare("DELETE FROM pin_codes WHERE user_id = ?").bind(auth.userId),
     env.DB.prepare("DELETE FROM recovery_codes WHERE user_id = ?").bind(auth.userId),
     env.DB.prepare("DELETE FROM password_resets WHERE user_id = ?").bind(auth.userId),
     env.DB.prepare("DELETE FROM email_verifications WHERE user_id = ?").bind(auth.userId),
@@ -1209,6 +1312,13 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (path === "/auth/register" && method === "POST") return handleRegister(request, env);
     if (path === "/auth/login" && method === "POST") return handleLogin(request, env);
     if (path === "/auth/refresh" && method === "POST") return handleRefresh(request, env);
+    if (path === "/auth/password" && method === "POST") return handleSetPassword(request, env);
+    if (path === "/auth/capabilities" && method === "GET") return handleAuthCapabilities(request, env);
+    if (path === "/auth/pin" && method === "POST") return handleSetPin(request, env);
+    if (path === "/auth/pin" && method === "DELETE") return handleRemovePin(request, env);
+    if (path === "/auth/pin/status" && method === "GET") return handlePinStatus(request, env);
+    if (path === "/auth/pin/login" && method === "POST") return handlePinLogin(request, env);
+    if (path === "/sessions/revoke-others" && method === "POST") return handleRevokeOtherSessions(request, env);
     if (path === "/auth/logout" && method === "POST") return handleLogout(request, env);
     if (path === "/auth/reset/request" && method === "POST") return handleResetRequest(request, env);
     if (path === "/auth/reset/confirm" && method === "POST") return handleResetConfirm(request, env);
@@ -1300,4 +1410,3 @@ export default {
   },
 };
 
-export { RateLimiter as RateLimiterExport, SessionHub as SessionHubExport };
