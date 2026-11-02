@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
   password_hash TEXT NOT NULL,
+  email_verified_at INTEGER,
   bio TEXT NOT NULL DEFAULT '',
   language TEXT NOT NULL DEFAULT 'pl',
   persona TEXT NOT NULL DEFAULT '',
@@ -21,6 +22,22 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+
+
+
+CREATE TABLE IF NOT EXISTS pin_codes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  pin_hash TEXT NOT NULL,
+  failed_attempts INTEGER NOT NULL DEFAULT 0,
+  locked_until INTEGER,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
+  UNIQUE (user_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pin_lookup ON pin_codes (device_id);
 
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
