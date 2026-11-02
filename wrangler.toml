@@ -34,6 +34,3 @@ MEDIA_PUBLIC_BASE = "https://al2100beta.axelgadomski.workers.dev/media"
 
 [observability]
 enabled = true
-
-[limits]
-cpu_ms = 200
